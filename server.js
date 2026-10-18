@@ -99,12 +99,21 @@ app.get("/api/account/profile", (req, res) => {
     res.json({ success: true, user: { username: user.username, weisxId: user.weisxId, recoveryEmail: user.recoveryEmail, recoveryEmailVerified: user.recoveryEmailVerified } });
 });
 
+// Descobre o nome da conta a partir do token de login (ou null se inválido)
+function resolveUsernameFromToken(token) {
+    if (!token || typeof token !== "string") return null;
+    const key = tokens.get(token);
+    const user = key ? users.get(key) : null;
+    return user ? user.username : null;
+}
+
 // WebSocket para Salas e Transmissão
 io.on("connection", socket => {
     let currentRoomCode = null;
     let currentUsername = "Convidado";
 
-    socket.on("create-room", roomCode => {
+    socket.on("create-room", (roomCode, auth) => {
+        currentUsername = resolveUsernameFromToken(auth && auth.token) || "Convidado";
         currentRoomCode = roomCode;
         socket.join(roomCode);
         rooms.set(roomCode, {
@@ -115,12 +124,13 @@ io.on("connection", socket => {
         updateRoomState(roomCode);
     });
 
-    socket.on("join-room", roomCode => {
+    socket.on("join-room", (roomCode, auth) => {
         const room = rooms.get(roomCode);
         if (!room) {
             socket.emit("room-error", "Sala não encontrada.");
             return;
         }
+        currentUsername = resolveUsernameFromToken(auth && auth.token) || "Convidado";
         currentRoomCode = roomCode;
         socket.join(roomCode);
         room.participants.set(socket.id, { id: socket.id, name: currentUsername, isHost: false, broadcasting: false });
