@@ -806,7 +806,6 @@ io.on("connection", socket => {
 
             await pool.query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner')", [created.id, socket.data.user.id]);
             await pool.query("INSERT INTO channels (server_id, name, position) VALUES ($1, 'Geral', 1)", [created.id]);
-            await pool.query("INSERT INTO channels (server_id, name, position) VALUES ($1, 'Resenha', 2)", [created.id]);
             await loadChannels();
 
             socket.data.roles.set(created.id, "owner");
