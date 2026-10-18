@@ -91,35 +91,6 @@ function broadcastServer(serverId) {
     });
 }
 
-// Garante que o usuário é membro do servidor WEISX e devolve o cargo dele
-async function ensureMainMembership(user) {
-    const server = (await pool.query("SELECT id, owner_id FROM servers WHERE id = $1", [mainServerId])).rows[0];
-
-    if (!server.owner_id) {
-        const wanted = (process.env.OWNER_USERNAME || "").trim().toLowerCase();
-        const ownerRow = wanted
-            ? (await pool.query("SELECT id FROM users WHERE username_lower = $1", [wanted])).rows[0]
-            : (await pool.query("SELECT id FROM users ORDER BY id LIMIT 1")).rows[0];
-        if (ownerRow) {
-            await pool.query("UPDATE servers SET owner_id = $1 WHERE id = $2 AND owner_id IS NULL", [ownerRow.id, mainServerId]);
-            await pool.query(
-                `INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner')
-                 ON CONFLICT (server_id, user_id) DO UPDATE SET role = 'owner'`,
-                [mainServerId, ownerRow.id]
-            );
-        }
-    }
-
-    await pool.query(
-        "INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT (server_id, user_id) DO NOTHING",
-        [mainServerId, user.id]
-    );
-    const member = (await pool.query(
-        "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2", [mainServerId, user.id]
-    )).rows[0];
-    return member ? member.role : "member";
-}
-
 async function getRole(userId, serverId) {
     const result = await pool.query(
         "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2",
@@ -270,19 +241,11 @@ async function initDb() {
     `);
     await pool.query("ALTER TABLE channels ADD COLUMN IF NOT EXISTS category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL");
 
-    let main = (await pool.query("SELECT id FROM servers WHERE is_main LIMIT 1")).rows[0];
-    if (!main) {
-        main = (await pool.query("INSERT INTO servers (name, is_main) VALUES ('WEISX', TRUE) RETURNING id")).rows[0];
-    }
-    mainServerId = main.id;
-
-    const count = (await pool.query("SELECT COUNT(*)::int AS n FROM channels WHERE server_id = $1", [mainServerId])).rows[0].n;
-    if (count === 0) {
-        const defaults = ["Geral", "Resenha", "Duo", "Trio", "Squad"];
-        for (let i = 0; i < defaults.length; i++) {
-            await pool.query("INSERT INTO channels (server_id, name, position) VALUES ($1, $2, $3)", [mainServerId, defaults[i], i + 1]);
-        }
-    }
+    // Não existe mais um grupo "oficial" que todo mundo ganha de graça.
+    // Se sobrou o antigo WEISX automático (is_main), ele é apagado uma única vez
+    // para o nome ficar livre e cada pessoa criar o seu próprio grupo.
+    const legacy = await pool.query("DELETE FROM servers WHERE is_main RETURNING id");
+    if (legacy.rowCount > 0) console.log("Grupo WEISX automático antigo removido (" + legacy.rowCount + ").");
     await loadChannels();
 }
 
@@ -581,7 +544,6 @@ io.on("connection", socket => {
             socket.data.user = { id: user.id, username: user.username, avatar: user.avatar || null };
             socket.data.roles = new Map();
             registerUserSocket();
-            await ensureMainMembership(user);
             const memberships = await listMemberships(user.id);
             for (const row of memberships) {
                 socket.data.roles.set(row.id, row.role);
