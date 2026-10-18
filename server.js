@@ -1,7 +1,23 @@
 const express = require("express");
 const http = require("http");
+const crypto = require("crypto");
+const util = require("util");
 const { Server } = require("socket.io");
 const cors = require("cors");
+const { Pool } = require("pg");
+
+const scrypt = util.promisify(crypto.scrypt);
+
+if (!process.env.DATABASE_URL) {
+    console.error("ERRO: a variável DATABASE_URL não está configurada no Render.");
+    process.exit(1);
+}
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 5
+});
 
 const app = express();
 app.use(cors());
@@ -12,10 +28,8 @@ const io = new Server(server, {
     cors: { origin: "*" }
 });
 
-// Bases de dados em memória para teste rápido
-const users = new Map(); // username -> { username, password, weisxId, token }
-const tokens = new Map(); // token -> username
-const rooms = new Map(); // roomCode -> { hostId, participants: Map }
+// Salas ficam em memória (não precisam sobreviver a reinícios)
+const rooms = new Map(); // roomCode -> { hostId, participants: Map, viewers: Map }
 
 function viewersOf(room, broadcasterId) {
     if (!room.viewers) room.viewers = new Map();
@@ -23,94 +37,184 @@ function viewersOf(room, broadcasterId) {
     return room.viewers.get(broadcasterId);
 }
 
+// ---------- Banco de dados (contas e sessões) ----------
+const SESSION_DAYS = 90;
+
+async function initDb() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username TEXT NOT NULL,
+            username_lower TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            weisx_id TEXT NOT NULL UNIQUE,
+            recovery_email TEXT,
+            recovery_email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+    await pool.query(`DELETE FROM sessions WHERE created_at < NOW() - INTERVAL '${SESSION_DAYS} days'`);
+}
+
+async function hashPassword(password) {
+    const salt = crypto.randomBytes(16).toString("hex");
+    const hash = (await scrypt(password, salt, 64)).toString("hex");
+    return salt + ":" + hash;
+}
+
+async function verifyPassword(password, stored) {
+    const [salt, hash] = String(stored).split(":");
+    if (!salt || !hash) return false;
+    const test = await scrypt(password, salt, 64);
+    const expected = Buffer.from(hash, "hex");
+    return test.length === expected.length && crypto.timingSafeEqual(test, expected);
+}
+
+function publicUser(row) {
+    return {
+        username: row.username,
+        weisxId: row.weisx_id,
+        recoveryEmail: row.recovery_email,
+        recoveryEmailVerified: row.recovery_email_verified
+    };
+}
+
+function readToken(req) {
+    const header = req.headers.authorization;
+    if (!header) return null;
+    return header.split(" ")[1] || null;
+}
+
+async function getUserByToken(token) {
+    if (!token || typeof token !== "string") return null;
+    const result = await pool.query(
+        `SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+         WHERE s.token = $1 AND s.created_at > NOW() - INTERVAL '${SESSION_DAYS} days'`,
+        [token]
+    );
+    return result.rows[0] || null;
+}
+
+function serverError(res, error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: "Erro no servidor. Tente novamente." });
+}
+
 // Rota de Registo
-app.post("/api/auth/register", (req, res) => {
-    const { username, password } = req.body;
-    if (!username || !password) {
-        return res.status(400).json({ success: false, message: "Preencha todos os campos." });
-    }
-    const cleanUser = username.trim().toLowerCase();
-    if (users.has(cleanUser)) {
-        return res.status(400).json({ success: false, message: "Este nome de usuário já está em uso." });
-    }
+app.post("/api/auth/register", async (req, res) => {
+    try {
+        const { username, password } = req.body || {};
+        if (!username || !password) {
+            return res.status(400).json({ success: false, message: "Preencha todos os campos." });
+        }
+        const cleanName = String(username).trim();
+        if (!cleanName || cleanName.length > 32 || String(password).length > 128) {
+            return res.status(400).json({ success: false, message: "Nome de usuário ou senha em formato inválido." });
+        }
 
-    const weisxId = "W-" + Math.floor(100000 + Math.random() * 900000);
-    const newUser = { username: username.trim(), password, weisxId, recoveryEmail: null, recoveryEmailVerified: false };
-    users.set(cleanUser, newUser);
+        let weisxId;
+        for (let i = 0; i < 10; i++) {
+            const candidate = "W-" + Math.floor(100000 + Math.random() * 900000);
+            const taken = await pool.query("SELECT 1 FROM users WHERE weisx_id = $1", [candidate]);
+            if (taken.rowCount === 0) { weisxId = candidate; break; }
+        }
+        if (!weisxId) return serverError(res, new Error("Sem ID WEISX livre"));
 
-    res.json({ success: true, user: { username: newUser.username, weisxId: newUser.weisxId } });
+        const passwordHash = await hashPassword(String(password));
+        const result = await pool.query(
+            `INSERT INTO users (username, username_lower, password_hash, weisx_id)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (username_lower) DO NOTHING
+             RETURNING *`,
+            [cleanName, cleanName.toLowerCase(), passwordHash, weisxId]
+        );
+        if (result.rowCount === 0) {
+            return res.status(400).json({ success: false, message: "Este nome de usuário já está em uso." });
+        }
+
+        const user = result.rows[0];
+        res.json({ success: true, user: { username: user.username, weisxId: user.weisx_id } });
+    } catch (error) {
+        serverError(res, error);
+    }
 });
 
 // Rota de Login
-app.post("/api/auth/login", (req, res) => {
-    const { identifier, password } = req.body;
-    if (!identifier || !password) {
-        return res.status(400).json({ success: false, message: "Preencha a conta e a senha." });
-    }
-
-    const cleanId = identifier.trim().toLowerCase();
-    let foundUser = null;
-
-    for (const u of users.values()) {
-        if (u.username.toLowerCase() === cleanId || u.weisxId.toLowerCase() === cleanId) {
-            foundUser = u;
-            break;
+app.post("/api/auth/login", async (req, res) => {
+    try {
+        const { identifier, password } = req.body || {};
+        if (!identifier || !password) {
+            return res.status(400).json({ success: false, message: "Preencha a conta e a senha." });
         }
+
+        const cleanId = String(identifier).trim().toLowerCase();
+        const found = await pool.query(
+            "SELECT * FROM users WHERE username_lower = $1 OR LOWER(weisx_id) = $1 LIMIT 1",
+            [cleanId]
+        );
+        const user = found.rows[0];
+
+        if (!user || !(await verifyPassword(String(password), user.password_hash))) {
+            return res.status(401).json({ success: false, message: "Usuário ou senha incorretos." });
+        }
+
+        const token = crypto.randomBytes(32).toString("hex");
+        await pool.query("INSERT INTO sessions (token, user_id) VALUES ($1, $2)", [token, user.id]);
+
+        res.json({ success: true, token, user: publicUser(user) });
+    } catch (error) {
+        serverError(res, error);
     }
-
-    if (!foundUser || foundUser.password !== password) {
-        return res.status(401).json({ success: false, message: "Usuário ou senha incorretos." });
-    }
-
-    const token = "token-" + Math.random().toString(36).slice(2) + Date.now();
-    tokens.set(token, foundUser.username.toLowerCase());
-
-    res.json({
-        success: true,
-        token,
-        user: { username: foundUser.username, weisxId: foundUser.weisxId, recoveryEmail: foundUser.recoveryEmail, recoveryEmailVerified: foundUser.recoveryEmailVerified }
-    });
 });
 
 // Rota /me (Verificar sessão)
-app.get("/api/auth/me", (req, res) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader) return res.status(401).json({ success: false });
-    const token = authHeader.split(" ")[1];
-    const username = tokens.get(token);
-    if (!username || !users.has(username)) return res.status(401).json({ success: false });
-
-    const user = users.get(username);
-    res.json({ success: true, user: { username: user.username, weisxId: user.weisxId, recoveryEmail: user.recoveryEmail, recoveryEmailVerified: user.recoveryEmailVerified } });
-});
-
-app.post("/api/auth/logout", (req, res) => {
-    const authHeader = req.headers.authorization;
-    if (authHeader) {
-        const token = authHeader.split(" ")[1];
-        tokens.delete(token);
+app.get("/api/auth/me", async (req, res) => {
+    try {
+        const user = await getUserByToken(readToken(req));
+        if (!user) return res.status(401).json({ success: false });
+        res.json({ success: true, user: publicUser(user) });
+    } catch (error) {
+        serverError(res, error);
     }
-    res.json({ success: true });
 });
 
-// Perfil e outras rotas básicas
-app.get("/api/account/profile", (req, res) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader) return res.status(401).json({ success: false, message: "Sessão expirada." });
-    const token = authHeader.split(" ")[1];
-    const username = tokens.get(token);
-    if (!username || !users.has(username)) return res.status(401).json({ success: false, message: "Sessão expirada." });
+app.post("/api/auth/logout", async (req, res) => {
+    try {
+        const token = readToken(req);
+        if (token) await pool.query("DELETE FROM sessions WHERE token = $1", [token]);
+        res.json({ success: true });
+    } catch (error) {
+        serverError(res, error);
+    }
+});
 
-    const user = users.get(username);
-    res.json({ success: true, user: { username: user.username, weisxId: user.weisxId, recoveryEmail: user.recoveryEmail, recoveryEmailVerified: user.recoveryEmailVerified } });
+// Perfil
+app.get("/api/account/profile", async (req, res) => {
+    try {
+        const user = await getUserByToken(readToken(req));
+        if (!user) return res.status(401).json({ success: false, message: "Sessão expirada." });
+        res.json({ success: true, user: publicUser(user) });
+    } catch (error) {
+        serverError(res, error);
+    }
 });
 
 // Descobre o nome da conta a partir do token de login (ou null se inválido)
-function resolveUsernameFromToken(token) {
-    if (!token || typeof token !== "string") return null;
-    const key = tokens.get(token);
-    const user = key ? users.get(key) : null;
-    return user ? user.username : null;
+async function resolveUsernameFromToken(token) {
+    try {
+        const user = await getUserByToken(token);
+        return user ? user.username : null;
+    } catch (error) {
+        console.error("Erro ao validar token do socket:", error);
+        return null;
+    }
 }
 
 // WebSocket para Salas e Transmissão
@@ -118,8 +222,8 @@ io.on("connection", socket => {
     let currentRoomCode = null;
     let currentUsername = "Convidado";
 
-    socket.on("create-room", (roomCode, auth) => {
-        currentUsername = resolveUsernameFromToken(auth && auth.token) || "Convidado";
+    socket.on("create-room", async (roomCode, auth) => {
+        currentUsername = (await resolveUsernameFromToken(auth && auth.token)) || "Convidado";
         currentRoomCode = roomCode;
         socket.join(roomCode);
         rooms.set(roomCode, {
@@ -130,13 +234,13 @@ io.on("connection", socket => {
         updateRoomState(roomCode);
     });
 
-    socket.on("join-room", (roomCode, auth) => {
+    socket.on("join-room", async (roomCode, auth) => {
         const room = rooms.get(roomCode);
         if (!room) {
             socket.emit("room-error", "Sala não encontrada.");
             return;
         }
-        currentUsername = resolveUsernameFromToken(auth && auth.token) || "Convidado";
+        currentUsername = (await resolveUsernameFromToken(auth && auth.token)) || "Convidado";
         currentRoomCode = roomCode;
         socket.join(roomCode);
         room.participants.set(socket.id, { id: socket.id, name: currentUsername, isHost: false, broadcasting: false });
@@ -245,6 +349,14 @@ function updateRoomState(roomCode) {
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log("Servidor WEISX rodando na porta " + PORT);
-});
+initDb()
+    .then(() => {
+        console.log("Banco de dados conectado.");
+        server.listen(PORT, () => {
+            console.log("Servidor WEISX rodando na porta " + PORT);
+        });
+    })
+    .catch(error => {
+        console.error("Não foi possível iniciar o banco de dados:", error);
+        process.exit(1);
+    });
