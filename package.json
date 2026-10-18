@@ -1,13 +1,15 @@
 {
-  "name": "weisx-screen-backend",
-  "version": "1.0.0",
+  "name": "weisx-backend",
+  "version": "1.1.0",
+  "description": "Servidor do WEISX Screen",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "socket.io": "^4.7.2"
+    "express": "^4.21.2",
+    "pg": "^8.13.1",
+    "socket.io": "^4.8.1"
   }
 }
