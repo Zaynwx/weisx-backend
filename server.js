@@ -17,6 +17,12 @@ const users = new Map(); // username -> { username, password, weisxId, token }
 const tokens = new Map(); // token -> username
 const rooms = new Map(); // roomCode -> { hostId, participants: Map }
 
+function viewersOf(room, broadcasterId) {
+    if (!room.viewers) room.viewers = new Map();
+    if (!room.viewers.has(broadcasterId)) room.viewers.set(broadcasterId, new Set());
+    return room.viewers.get(broadcasterId);
+}
+
 // Rota de Registo
 app.post("/api/auth/register", (req, res) => {
     const { username, password } = req.body;
@@ -138,13 +144,15 @@ io.on("connection", socket => {
         updateRoomState(roomCode);
     });
 
-    socket.on("start-broadcast", () => {
+    socket.on("start-broadcast", data => {
         if (!currentRoomCode) return;
         const room = rooms.get(currentRoomCode);
         if (!room) return;
         const p = room.participants.get(socket.id);
         if (p) {
             p.broadcasting = true;
+            p.viewerLimit = Math.max(0, Math.min(50, parseInt(data && data.viewerLimit, 10) || 0));
+            viewersOf(room, socket.id).clear();
             socket.emit("broadcast-started-self");
             updateRoomState(currentRoomCode);
         }
@@ -157,6 +165,8 @@ io.on("connection", socket => {
         const p = room.participants.get(socket.id);
         if (p) {
             p.broadcasting = false;
+            p.viewerLimit = 0;
+            viewersOf(room, socket.id).clear();
             updateRoomState(currentRoomCode);
             io.to(currentRoomCode).emit("participant-broadcast-stopped", { participantId: socket.id });
         }
@@ -164,11 +174,28 @@ io.on("connection", socket => {
 
     socket.on("watch-stream", data => {
         if (!data || !data.broadcasterId) return;
+        const room = currentRoomCode ? rooms.get(currentRoomCode) : null;
+        const target = room ? room.participants.get(data.broadcasterId) : null;
+
+        if (room && target) {
+            const viewers = viewersOf(room, data.broadcasterId);
+            if (target.viewerLimit > 0 && !viewers.has(socket.id) && viewers.size >= target.viewerLimit) {
+                socket.emit("watch-error", {
+                    broadcasterId: data.broadcasterId,
+                    message: "Esta transmissão atingiu o limite de espectadores."
+                });
+                return;
+            }
+            viewers.add(socket.id);
+        }
+
         io.to(data.broadcasterId).emit("viewer-request", { viewerId: socket.id });
     });
 
     socket.on("stop-watching", data => {
         if (!data || !data.broadcasterId) return;
+        const room = currentRoomCode ? rooms.get(currentRoomCode) : null;
+        if (room) viewersOf(room, data.broadcasterId).delete(socket.id);
         io.to(data.broadcasterId).emit("viewer-left", { viewerId: socket.id });
     });
 
@@ -183,20 +210,31 @@ io.on("connection", socket => {
         });
     });
 
-    socket.on("disconnect", () => {
+    function leaveCurrentRoom() {
         if (!currentRoomCode) return;
-        const room = rooms.get(currentRoomCode);
+        const code = currentRoomCode;
+        currentRoomCode = null;
+        socket.leave(code);
+
+        const room = rooms.get(code);
         if (!room) return;
 
         if (room.hostId === socket.id) {
-            io.to(currentRoomCode).emit("host-left");
-            rooms.delete(currentRoomCode);
+            io.to(code).emit("host-left");
+            rooms.delete(code);
         } else {
             room.participants.delete(socket.id);
-            updateRoomState(currentRoomCode);
-            io.to(currentRoomCode).emit("participant-left", { participantId: socket.id });
+            if (room.viewers) {
+                room.viewers.delete(socket.id);
+                room.viewers.forEach(set => set.delete(socket.id));
+            }
+            updateRoomState(code);
+            io.to(code).emit("participant-left", { participantId: socket.id });
         }
-    });
+    }
+
+    socket.on("leave-room", leaveCurrentRoom);
+    socket.on("disconnect", leaveCurrentRoom);
 });
 
 function updateRoomState(roomCode) {
