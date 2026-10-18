@@ -37,33 +37,58 @@ function viewersOf(room, broadcasterId) {
     return room.viewers.get(broadcasterId);
 }
 
-// ---------- Servidor principal WEISX: canais, membros e chat ----------
+// ---------- Servidores (grupos), canais, membros e chat ----------
 let mainServerId = null;
-let channelCache = [];
+const channelsByServer = new Map(); // serverId -> [{ id, name }]
+const channelIndex = new Map();     // channelId -> serverId
+const categoriesByServer = new Map(); // serverId -> [{ id, name }]
+const categoryIndex = new Map();    // categoryId -> serverId
+const userSockets = new Map();      // userId -> Set(socket)
+const ROLE_RANK = { owner: 4, admin: 3, moderator: 2, member: 1 };
+const MAX_IMAGE_CHARS = 60000;
+
+function validImage(value) {
+    return typeof value === "string" && value.length <= MAX_IMAGE_CHARS &&
+        /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+\/=]+$/.test(value);
+}
+const joinFailures = new Map();     // "userId:serverId" -> { count, until }
 
 async function loadChannels() {
-    const result = await pool.query(
-        "SELECT id, name FROM channels WHERE server_id = $1 ORDER BY position, id",
-        [mainServerId]
-    );
-    channelCache = result.rows;
+    const result = await pool.query("SELECT id, server_id, name, category_id FROM channels ORDER BY position, id");
+    channelsByServer.clear();
+    channelIndex.clear();
+    for (const row of result.rows) {
+        if (!channelsByServer.has(row.server_id)) channelsByServer.set(row.server_id, []);
+        channelsByServer.get(row.server_id).push({ id: row.id, name: row.name, categoryId: row.category_id || null });
+        channelIndex.set(row.id, row.server_id);
+    }
+    const cats = await pool.query("SELECT id, server_id, name FROM categories ORDER BY position, id");
+    categoriesByServer.clear();
+    categoryIndex.clear();
+    for (const row of cats.rows) {
+        if (!categoriesByServer.has(row.server_id)) categoriesByServer.set(row.server_id, []);
+        categoriesByServer.get(row.server_id).push({ id: row.id, name: row.name });
+        categoryIndex.set(row.id, row.server_id);
+    }
 }
 
-function buildWorkspaceState() {
-    return {
-        server: { id: mainServerId, name: "WEISX" },
-        channels: channelCache.map(channel => {
-            const room = rooms.get("ch:" + channel.id);
-            const users = room
-                ? Array.from(room.participants.values()).map(p => ({ id: p.id, name: p.name, broadcasting: !!p.broadcasting }))
-                : [];
-            return { id: channel.id, name: channel.name, users };
-        })
-    };
+function channelsState(serverId) {
+    return (channelsByServer.get(serverId) || []).map(channel => {
+        const room = rooms.get("ch:" + channel.id);
+        const users = room
+            ? Array.from(room.participants.values()).map(p => ({ id: p.id, name: p.name, broadcasting: !!p.broadcasting, avatar: p.avatar || null }))
+            : [];
+        return { id: channel.id, name: channel.name, categoryId: channel.categoryId || null, users };
+    });
 }
 
-function broadcastWorkspace() {
-    io.to("srv:main").emit("workspace-state", buildWorkspaceState());
+function broadcastServer(serverId) {
+    if (!serverId) return;
+    io.to("srv:" + serverId).emit("server-state", {
+        serverId,
+        channels: channelsState(serverId),
+        categories: categoriesByServer.get(serverId) || []
+    });
 }
 
 // Garante que o usuário é membro do servidor WEISX e devolve o cargo dele
@@ -95,13 +120,46 @@ async function ensureMainMembership(user) {
     return member ? member.role : "member";
 }
 
-async function canManageChannels(socket) {
-    if (!socket.data.user) return false;
+async function getRole(userId, serverId) {
     const result = await pool.query(
         "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2",
-        [mainServerId, socket.data.user.id]
+        [serverId, userId]
     );
-    return !!result.rows[0] && ["owner", "admin"].includes(result.rows[0].role);
+    return result.rows[0] ? result.rows[0].role : null;
+}
+
+async function requireManager(socket, serverId) {
+    if (!socket.data.user || !serverId) return false;
+    const role = await getRole(socket.data.user.id, serverId);
+    return role === "owner" || role === "admin";
+}
+
+async function listMemberships(userId) {
+    const result = await pool.query(
+        `SELECT s.id, s.name, s.is_main, (s.password_hash IS NOT NULL) AS has_password, s.icon, m.role
+         FROM server_members m JOIN servers s ON s.id = m.server_id
+         WHERE m.user_id = $1 ORDER BY s.is_main DESC, s.id`,
+        [userId]
+    );
+    return result.rows;
+}
+
+function serverPayload(row) {
+    return {
+        id: row.id,
+        name: row.name,
+        isMain: !!row.is_main,
+        hasPassword: !!row.has_password,
+        role: row.role,
+        icon: row.icon || null,
+        channels: channelsState(row.id),
+        categories: categoriesByServer.get(row.id) || []
+    };
+}
+
+function cleanServerName(value) {
+    const name = String(value || "").replace(/[\u0000-\u001f\u007f]/g, "").replace(/\s+/g, " ").trim();
+    return name.length >= 2 && name.length <= 32 ? name : null;
 }
 
 async function loadMessages(channelId) {
@@ -199,6 +257,18 @@ async function initDb() {
     `);
 
     await pool.query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'msg'");
+    await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS servers_name_lower ON servers (LOWER(name))");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT");
+    await pool.query("ALTER TABLE servers ADD COLUMN IF NOT EXISTS icon TEXT");
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS categories (
+            id SERIAL PRIMARY KEY,
+            server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0
+        )
+    `);
+    await pool.query("ALTER TABLE channels ADD COLUMN IF NOT EXISTS category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL");
 
     let main = (await pool.query("SELECT id FROM servers WHERE is_main LIMIT 1")).rows[0];
     if (!main) {
@@ -471,6 +541,7 @@ io.on("connection", socket => {
         if (!currentRoomCode) return;
         const code = currentRoomCode;
         currentRoomCode = null;
+        socket.data.currentRoom = null;
         socket.leave(code);
 
         const room = rooms.get(code);
@@ -491,7 +562,7 @@ io.on("connection", socket => {
             }
             if (room.channelId && room.participants.size === 0) {
                 rooms.delete(code);
-                broadcastWorkspace();
+                broadcastServer(room.serverId);
             } else {
                 updateRoomState(code);
             }
@@ -507,20 +578,28 @@ io.on("connection", socket => {
                 socket.emit("workspace-error", "Sessão inválida. Entre novamente.");
                 return;
             }
-            socket.data.user = { id: user.id, username: user.username };
-            socket.join("srv:main");
-            const role = await ensureMainMembership(user);
-            socket.emit("workspace-ready", { role, state: buildWorkspaceState() });
+            socket.data.user = { id: user.id, username: user.username, avatar: user.avatar || null };
+            socket.data.roles = new Map();
+            registerUserSocket();
+            await ensureMainMembership(user);
+            const memberships = await listMemberships(user.id);
+            for (const row of memberships) {
+                socket.data.roles.set(row.id, row.role);
+                socket.join("srv:" + row.id);
+            }
+            socket.emit("workspace-ready", { servers: memberships.map(serverPayload), me: { avatar: user.avatar || null } });
         } catch (error) {
-            console.error("Erro ao abrir o servidor WEISX:", error);
-            socket.emit("workspace-error", "Não foi possível carregar o servidor. Tente novamente.");
+            console.error("Erro ao abrir a área de trabalho:", error);
+            socket.emit("workspace-error", "Não foi possível carregar os grupos. Tente novamente.");
         }
     });
 
     socket.on("close-workspace", () => {
+        unregisterUserSocket();
         leaveCurrentRoom();
+        if (socket.data.roles) socket.data.roles.forEach((role, id) => socket.leave("srv:" + id));
+        socket.data.roles = null;
         socket.data.user = null;
-        socket.leave("srv:main");
     });
 
     socket.on("join-channel", async data => {
@@ -530,9 +609,14 @@ io.on("connection", socket => {
                 return;
             }
             const channelId = parseInt(data && data.channelId, 10);
-            const channel = channelCache.find(c => c.id === channelId);
+            const serverId = channelIndex.get(channelId);
+            const channel = serverId ? (channelsByServer.get(serverId) || []).find(c => c.id === channelId) : null;
             if (!channel) {
                 socket.emit("room-error", "Canal não encontrado.");
+                return;
+            }
+            if (!socket.data.roles || !socket.data.roles.has(serverId)) {
+                socket.emit("room-error", "Você não faz parte deste grupo.");
                 return;
             }
 
@@ -541,16 +625,23 @@ io.on("connection", socket => {
             const code = "ch:" + channelId;
             let room = rooms.get(code);
             if (!room) {
-                room = { hostId: null, channelId, participants: new Map(), viewers: new Map() };
+                room = { hostId: null, channelId, serverId, participants: new Map(), viewers: new Map() };
                 rooms.set(code, room);
             }
             currentRoomCode = code;
+            socket.data.currentRoom = code;
             currentUsername = socket.data.user.username;
             socket.join(code);
-            room.participants.set(socket.id, { id: socket.id, name: currentUsername, isHost: false, broadcasting: false });
+            room.participants.set(socket.id, { id: socket.id, name: currentUsername, isHost: false, broadcasting: false, avatar: socket.data.user.avatar || null });
 
             socket.emit("room-joined", { selfId: socket.id, roomCode: code, channelId, channelName: channel.name });
-            socket.emit("chat-history", { channelId, messages: await loadMessages(channelId) });
+            const avatarRows = (await pool.query(
+                "SELECT username, avatar FROM users WHERE avatar IS NOT NULL AND username IN (SELECT DISTINCT username FROM messages WHERE channel_id = $1)",
+                [channelId]
+            )).rows;
+            const avatars = {};
+            for (const row of avatarRows) avatars[row.username] = row.avatar;
+            socket.emit("chat-history", { channelId, messages: await loadMessages(channelId), avatars });
             updateRoomState(code);
             await postSystem(channelId, currentUsername, "join");
         } catch (error) {
@@ -588,43 +679,73 @@ io.on("connection", socket => {
         }
     });
 
+    function serverError(where, message) {
+        socket.emit("server-error", { where, message });
+    }
+
+    function registerUserSocket() {
+        const id = socket.data.user.id;
+        if (!userSockets.has(id)) userSockets.set(id, new Set());
+        userSockets.get(id).add(socket);
+        socket.data.leaveRoom = leaveCurrentRoom;
+    }
+
+    function unregisterUserSocket() {
+        const user = socket.data.user;
+        if (!user) return;
+        const set = userSockets.get(user.id);
+        if (set) {
+            set.delete(socket);
+            if (set.size === 0) userSockets.delete(user.id);
+        }
+    }
+
+    async function actorRole(serverId) {
+        if (!socket.data.user || !serverId) return null;
+        return getRole(socket.data.user.id, serverId);
+    }
+
     socket.on("channel-create", async data => {
         try {
-            if (!(await canManageChannels(socket))) {
-                socket.emit("workspace-error", "Você não tem permissão para criar canais.");
+            const serverId = parseInt(data && data.serverId, 10);
+            if (!(await requireManager(socket, serverId))) {
+                serverError("other", "Você não tem permissão para criar canais neste grupo.");
                 return;
             }
             const name = String((data && data.name) || "").trim().slice(0, 32);
             if (!name) return;
-            if (channelCache.length >= 30) {
-                socket.emit("workspace-error", "Limite de 30 canais atingido.");
+            if ((channelsByServer.get(serverId) || []).length >= 30) {
+                serverError("other", "Limite de 30 canais atingido.");
                 return;
             }
+            let categoryId = parseInt(data && data.categoryId, 10);
+            if (!categoryId || categoryIndex.get(categoryId) !== serverId) categoryId = null;
             await pool.query(
-                `INSERT INTO channels (server_id, name, position)
-                 VALUES ($1, $2, COALESCE((SELECT MAX(position) FROM channels WHERE server_id = $1), 0) + 1)`,
-                [mainServerId, name]
+                `INSERT INTO channels (server_id, name, position, category_id)
+                 VALUES ($1, $2, COALESCE((SELECT MAX(position) FROM channels WHERE server_id = $1), 0) + 1, $3)`,
+                [serverId, name, categoryId]
             );
             await loadChannels();
-            broadcastWorkspace();
+            broadcastServer(serverId);
         } catch (error) {
             console.error("Erro ao criar canal:", error);
-            socket.emit("workspace-error", "Não foi possível criar o canal.");
+            serverError("other", "Não foi possível criar o canal.");
         }
     });
 
     socket.on("channel-rename", async data => {
         try {
-            if (!(await canManageChannels(socket))) {
-                socket.emit("workspace-error", "Você não tem permissão para renomear canais.");
+            const channelId = parseInt(data && data.channelId, 10);
+            const serverId = channelIndex.get(channelId);
+            if (!(await requireManager(socket, serverId))) {
+                serverError("other", "Você não tem permissão para renomear canais.");
                 return;
             }
-            const channelId = parseInt(data && data.channelId, 10);
             const name = String((data && data.name) || "").trim().slice(0, 32);
-            if (!name || !channelCache.find(c => c.id === channelId)) return;
-            await pool.query("UPDATE channels SET name = $1 WHERE id = $2 AND server_id = $3", [name, channelId, mainServerId]);
+            if (!name) return;
+            await pool.query("UPDATE channels SET name = $1 WHERE id = $2 AND server_id = $3", [name, channelId, serverId]);
             await loadChannels();
-            broadcastWorkspace();
+            broadcastServer(serverId);
         } catch (error) {
             console.error("Erro ao renomear canal:", error);
         }
@@ -632,28 +753,410 @@ io.on("connection", socket => {
 
     socket.on("channel-delete", async data => {
         try {
-            if (!(await canManageChannels(socket))) {
-                socket.emit("workspace-error", "Você não tem permissão para excluir canais.");
+            const channelId = parseInt(data && data.channelId, 10);
+            const serverId = channelIndex.get(channelId);
+            if (!(await requireManager(socket, serverId))) {
+                serverError("other", "Você não tem permissão para excluir canais.");
                 return;
             }
-            const channelId = parseInt(data && data.channelId, 10);
-            if (!channelCache.find(c => c.id === channelId)) return;
-
             const code = "ch:" + channelId;
             io.to(code).emit("channel-deleted", { channelId });
             io.in(code).socketsLeave(code);
             rooms.delete(code);
 
-            await pool.query("DELETE FROM channels WHERE id = $1 AND server_id = $2", [channelId, mainServerId]);
+            await pool.query("DELETE FROM channels WHERE id = $1 AND server_id = $2", [channelId, serverId]);
             await loadChannels();
-            broadcastWorkspace();
+            broadcastServer(serverId);
         } catch (error) {
             console.error("Erro ao excluir canal:", error);
         }
     });
 
+    // ----- Grupos próprios: criar, pesquisar pelo nome, entrar (com senha), sair, excluir -----
+    socket.on("server-create", async data => {
+        try {
+            if (!socket.data.user) return serverError("create", "Sessão inválida. Entre novamente.");
+            const name = cleanServerName(data && data.name);
+            if (!name) return serverError("create", "O nome do grupo precisa ter de 2 a 32 caracteres.");
+            const password = String((data && data.password) || "");
+            if (password && (password.length < 4 || password.length > 64)) {
+                return serverError("create", "A senha precisa ter de 4 a 64 caracteres.");
+            }
+            const owned = await pool.query(
+                "SELECT COUNT(*)::int AS n FROM servers WHERE owner_id = $1 AND NOT is_main",
+                [socket.data.user.id]
+            );
+            if (owned.rows[0].n >= 5) {
+                return serverError("create", "Você já criou 5 grupos. Exclua um para criar outro.");
+            }
+
+            const hash = password ? await hashPassword(password) : null;
+            let created;
+            try {
+                created = (await pool.query(
+                    "INSERT INTO servers (name, owner_id, password_hash) VALUES ($1, $2, $3) RETURNING id",
+                    [name, socket.data.user.id, hash]
+                )).rows[0];
+            } catch (error) {
+                if (error && error.code === "23505") {
+                    return serverError("create", "Já existe um grupo com esse nome. Escolha outro.");
+                }
+                throw error;
+            }
+
+            await pool.query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner')", [created.id, socket.data.user.id]);
+            await pool.query("INSERT INTO channels (server_id, name, position) VALUES ($1, 'Geral', 1)", [created.id]);
+            await pool.query("INSERT INTO channels (server_id, name, position) VALUES ($1, 'Resenha', 2)", [created.id]);
+            await loadChannels();
+
+            socket.data.roles.set(created.id, "owner");
+            socket.join("srv:" + created.id);
+            socket.emit("server-added", serverPayload({ id: created.id, name, is_main: false, has_password: !!hash, role: "owner" }));
+        } catch (error) {
+            console.error("Erro ao criar grupo:", error);
+            serverError("create", "Não foi possível criar o grupo. Tente novamente.");
+        }
+    });
+
+    socket.on("server-search", async data => {
+        try {
+            if (!socket.data.user) return;
+            const now = Date.now();
+            if (now - (socket.data.lastSearch || 0) < 700) return;
+            socket.data.lastSearch = now;
+
+            const name = String((data && data.name) || "").trim().slice(0, 32);
+            if (name.length < 2) return;
+            const row = (await pool.query(
+                `SELECT s.id, s.name, (s.password_hash IS NOT NULL) AS has_password,
+                        (SELECT COUNT(*)::int FROM server_members WHERE server_id = s.id) AS members, s.icon
+                 FROM servers s WHERE LOWER(s.name) = LOWER($1)`,
+                [name]
+            )).rows[0];
+
+            if (!row) {
+                socket.emit("server-search-result", { query: name, found: false });
+                return;
+            }
+            socket.emit("server-search-result", {
+                query: name,
+                found: true,
+                server: {
+                    id: row.id,
+                    name: row.name,
+                    hasPassword: !!row.has_password,
+                    members: row.members,
+                    icon: row.icon || null,
+                    isMember: socket.data.roles.has(row.id)
+                }
+            });
+        } catch (error) {
+            console.error("Erro na busca de grupo:", error);
+        }
+    });
+
+    socket.on("server-join", async data => {
+        try {
+            if (!socket.data.user) return serverError("join", "Sessão inválida. Entre novamente.");
+            const serverId = parseInt(data && data.serverId, 10);
+            const found = (await pool.query(
+                "SELECT id, name, is_main, password_hash FROM servers WHERE id = $1", [serverId]
+            )).rows[0];
+            if (!found) return serverError("join", "Grupo não encontrado.");
+
+            const userId = socket.data.user.id;
+            let role = await getRole(userId, serverId);
+
+            if (!role) {
+                if (found.password_hash) {
+                    const key = userId + ":" + serverId;
+                    const state = joinFailures.get(key) || { count: 0, until: 0 };
+                    if (state.until > Date.now()) {
+                        return serverError("join", "Muitas tentativas erradas. Espere um minuto e tente de novo.");
+                    }
+                    const ok = await verifyPassword(String((data && data.password) || ""), found.password_hash);
+                    if (!ok) {
+                        state.count += 1;
+                        if (state.count >= 5) { state.until = Date.now() + 60000; state.count = 0; }
+                        joinFailures.set(key, state);
+                        return serverError("join", "Senha incorreta.");
+                    }
+                    joinFailures.delete(key);
+                }
+                await pool.query(
+                    "INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT (server_id, user_id) DO NOTHING",
+                    [serverId, userId]
+                );
+                role = (await getRole(userId, serverId)) || "member";
+            }
+
+            socket.data.roles.set(serverId, role);
+            socket.join("srv:" + serverId);
+            socket.emit("server-added", serverPayload({
+                id: found.id, name: found.name, is_main: found.is_main, has_password: !!found.password_hash, role
+            }));
+        } catch (error) {
+            console.error("Erro ao entrar no grupo:", error);
+            serverError("join", "Não foi possível entrar no grupo. Tente novamente.");
+        }
+    });
+
+    socket.on("server-leave", async data => {
+        try {
+            if (!socket.data.user) return;
+            const serverId = parseInt(data && data.serverId, 10);
+            if (!serverId || serverId === mainServerId) return;
+            const role = await getRole(socket.data.user.id, serverId);
+            if (!role) return;
+            if (role === "owner") {
+                return serverError("other", "O dono não pode sair do próprio grupo. Exclua o grupo se não quiser mais.");
+            }
+            const current = currentRoomCode ? rooms.get(currentRoomCode) : null;
+            if (current && current.serverId === serverId) leaveCurrentRoom();
+
+            await pool.query("DELETE FROM server_members WHERE server_id = $1 AND user_id = $2", [serverId, socket.data.user.id]);
+            socket.data.roles.delete(serverId);
+            socket.leave("srv:" + serverId);
+            socket.emit("server-removed", { serverId, reason: "left" });
+        } catch (error) {
+            console.error("Erro ao sair do grupo:", error);
+        }
+    });
+
+    socket.on("server-delete", async data => {
+        try {
+            if (!socket.data.user) return;
+            const serverId = parseInt(data && data.serverId, 10);
+            if (!serverId || serverId === mainServerId) return;
+            const role = await getRole(socket.data.user.id, serverId);
+            if (role !== "owner") return serverError("other", "Só o dono pode excluir o grupo.");
+
+            for (const channel of channelsByServer.get(serverId) || []) {
+                const code = "ch:" + channel.id;
+                io.in(code).socketsLeave(code);
+                rooms.delete(code);
+            }
+            io.to("srv:" + serverId).emit("server-removed", { serverId, reason: "deleted" });
+            io.in("srv:" + serverId).socketsLeave("srv:" + serverId);
+
+            await pool.query("DELETE FROM servers WHERE id = $1", [serverId]);
+            await loadChannels();
+        } catch (error) {
+            console.error("Erro ao excluir grupo:", error);
+        }
+    });
+
+    socket.on("server-password", async data => {
+        try {
+            if (!socket.data.user) return;
+            const serverId = parseInt(data && data.serverId, 10);
+            if (!serverId || serverId === mainServerId) return;
+            const role = await getRole(socket.data.user.id, serverId);
+            if (role !== "owner") return serverError("other", "Só o dono pode mudar a senha do grupo.");
+            const password = String((data && data.password) || "");
+            if (password && (password.length < 4 || password.length > 64)) {
+                return serverError("other", "A senha precisa ter de 4 a 64 caracteres.");
+            }
+            const hash = password ? await hashPassword(password) : null;
+            await pool.query("UPDATE servers SET password_hash = $1 WHERE id = $2", [hash, serverId]);
+            io.to("srv:" + serverId).emit("server-info", { serverId, hasPassword: !!hash });
+        } catch (error) {
+            console.error("Erro ao mudar a senha do grupo:", error);
+        }
+    });
+
+    // ----- Categorias -----
+    socket.on("category-create", async data => {
+        try {
+            const serverId = parseInt(data && data.serverId, 10);
+            if (!(await requireManager(socket, serverId))) return serverError("other", "Você não tem permissão para criar categorias.");
+            const name = String((data && data.name) || "").replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 32);
+            if (!name) return;
+            if ((categoriesByServer.get(serverId) || []).length >= 10) return serverError("other", "Limite de 10 categorias atingido.");
+            await pool.query(
+                `INSERT INTO categories (server_id, name, position)
+                 VALUES ($1, $2, COALESCE((SELECT MAX(position) FROM categories WHERE server_id = $1), 0) + 1)`,
+                [serverId, name]
+            );
+            await loadChannels();
+            broadcastServer(serverId);
+        } catch (error) {
+            console.error("Erro ao criar categoria:", error);
+        }
+    });
+
+    socket.on("category-rename", async data => {
+        try {
+            const categoryId = parseInt(data && data.categoryId, 10);
+            const serverId = categoryIndex.get(categoryId);
+            if (!(await requireManager(socket, serverId))) return serverError("other", "Você não tem permissão para renomear categorias.");
+            const name = String((data && data.name) || "").replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 32);
+            if (!name) return;
+            await pool.query("UPDATE categories SET name = $1 WHERE id = $2 AND server_id = $3", [name, categoryId, serverId]);
+            await loadChannels();
+            broadcastServer(serverId);
+        } catch (error) {
+            console.error("Erro ao renomear categoria:", error);
+        }
+    });
+
+    socket.on("category-delete", async data => {
+        try {
+            const categoryId = parseInt(data && data.categoryId, 10);
+            const serverId = categoryIndex.get(categoryId);
+            if (!(await requireManager(socket, serverId))) return serverError("other", "Você não tem permissão para excluir categorias.");
+            await pool.query("DELETE FROM categories WHERE id = $1 AND server_id = $2", [categoryId, serverId]);
+            await loadChannels();
+            broadcastServer(serverId);
+        } catch (error) {
+            console.error("Erro ao excluir categoria:", error);
+        }
+    });
+
+    socket.on("channel-move", async data => {
+        try {
+            const channelId = parseInt(data && data.channelId, 10);
+            const serverId = channelIndex.get(channelId);
+            if (!(await requireManager(socket, serverId))) return serverError("other", "Você não tem permissão para organizar canais.");
+            let categoryId = data && data.categoryId ? parseInt(data.categoryId, 10) : null;
+            if (categoryId && categoryIndex.get(categoryId) !== serverId) return;
+            await pool.query("UPDATE channels SET category_id = $1 WHERE id = $2 AND server_id = $3", [categoryId || null, channelId, serverId]);
+            await loadChannels();
+            broadcastServer(serverId);
+        } catch (error) {
+            console.error("Erro ao mover canal:", error);
+        }
+    });
+
+    // ----- Nome e foto do grupo -----
+    socket.on("server-rename", async data => {
+        try {
+            const serverId = parseInt(data && data.serverId, 10);
+            if (!serverId || serverId === mainServerId) return;
+            if ((await actorRole(serverId)) !== "owner") return serverError("other", "Só o dono pode renomear o grupo.");
+            const name = cleanServerName(data && data.name);
+            if (!name) return serverError("other", "O nome do grupo precisa ter de 2 a 32 caracteres.");
+            try {
+                await pool.query("UPDATE servers SET name = $1 WHERE id = $2", [name, serverId]);
+            } catch (error) {
+                if (error && error.code === "23505") return serverError("other", "Já existe um grupo com esse nome.");
+                throw error;
+            }
+            io.to("srv:" + serverId).emit("server-info", { serverId, name });
+        } catch (error) {
+            console.error("Erro ao renomear grupo:", error);
+        }
+    });
+
+    socket.on("server-icon", async data => {
+        try {
+            const serverId = parseInt(data && data.serverId, 10);
+            if (!(await requireManager(socket, serverId))) return serverError("other", "Você não tem permissão para trocar a foto do grupo.");
+            const icon = data && data.icon ? data.icon : null;
+            if (icon !== null && !validImage(icon)) return serverError("other", "Imagem inválida ou grande demais.");
+            await pool.query("UPDATE servers SET icon = $1 WHERE id = $2", [icon, serverId]);
+            io.to("srv:" + serverId).emit("server-info", { serverId, icon });
+        } catch (error) {
+            console.error("Erro ao trocar a foto do grupo:", error);
+        }
+    });
+
+    // ----- Foto de perfil -----
+    socket.on("avatar-set", async data => {
+        try {
+            if (!socket.data.user) return;
+            const avatar = data && data.avatar ? data.avatar : null;
+            if (avatar !== null && !validImage(avatar)) return serverError("other", "Imagem inválida ou grande demais.");
+            await pool.query("UPDATE users SET avatar = $1 WHERE id = $2", [avatar, socket.data.user.id]);
+            const sockets = userSockets.get(socket.data.user.id) || new Set([socket]);
+            for (const s of sockets) {
+                s.data.user.avatar = avatar;
+                const room = s.data.currentRoom ? rooms.get(s.data.currentRoom) : null;
+                const me = room && room.participants.get(s.id);
+                if (me) {
+                    me.avatar = avatar;
+                    updateRoomState(s.data.currentRoom);
+                }
+                s.emit("avatar-saved", { avatar });
+            }
+        } catch (error) {
+            console.error("Erro ao salvar a foto de perfil:", error);
+        }
+    });
+
+    // ----- Membros e cargos -----
+    async function sendMembers(serverId) {
+        const rows = (await pool.query(
+            `SELECT u.id, u.username, m.role
+             FROM server_members m JOIN users u ON u.id = m.user_id
+             WHERE m.server_id = $1 ORDER BY m.role, LOWER(u.username) LIMIT 300`,
+            [serverId]
+        )).rows;
+        const members = rows.map(r => ({ userId: r.id, name: r.username, role: r.role, online: userSockets.has(r.id) }))
+            .sort((a, b) => (ROLE_RANK[b.role] - ROLE_RANK[a.role]) || a.name.localeCompare(b.name));
+        socket.emit("members-result", { serverId, members });
+    }
+
+    socket.on("members-list", async data => {
+        try {
+            const serverId = parseInt(data && data.serverId, 10);
+            if (!(await actorRole(serverId))) return;
+            await sendMembers(serverId);
+        } catch (error) {
+            console.error("Erro ao listar membros:", error);
+        }
+    });
+
+    socket.on("member-role", async data => {
+        try {
+            const serverId = parseInt(data && data.serverId, 10);
+            const targetId = parseInt(data && data.userId, 10);
+            const role = data && data.role;
+            if ((await actorRole(serverId)) !== "owner") return serverError("other", "Só o dono pode mudar cargos.");
+            if (!["admin", "moderator", "member"].includes(role)) return;
+            const targetRole = await getRole(targetId, serverId);
+            if (!targetRole || targetRole === "owner") return;
+            await pool.query("UPDATE server_members SET role = $1 WHERE server_id = $2 AND user_id = $3", [role, serverId, targetId]);
+            for (const s of userSockets.get(targetId) || []) {
+                if (s.data.roles) s.data.roles.set(serverId, role);
+                s.emit("server-role", { serverId, role });
+            }
+            await sendMembers(serverId);
+        } catch (error) {
+            console.error("Erro ao mudar cargo:", error);
+        }
+    });
+
+    socket.on("member-kick", async data => {
+        try {
+            const serverId = parseInt(data && data.serverId, 10);
+            const targetId = parseInt(data && data.userId, 10);
+            if (!serverId || serverId === mainServerId) return;
+            const mine = await actorRole(serverId);
+            if (!mine || ROLE_RANK[mine] < ROLE_RANK.moderator) return serverError("other", "Você não tem permissão para remover membros.");
+            const targetRole = await getRole(targetId, serverId);
+            if (!targetRole || targetId === socket.data.user.id) return;
+            if (ROLE_RANK[targetRole] >= ROLE_RANK[mine]) return serverError("other", "Você não pode remover alguém com cargo igual ou maior que o seu.");
+            await pool.query("DELETE FROM server_members WHERE server_id = $1 AND user_id = $2", [serverId, targetId]);
+            for (const s of Array.from(userSockets.get(targetId) || [])) {
+                const code = s.data.currentRoom;
+                const room = code ? rooms.get(code) : null;
+                if (room && room.serverId === serverId && s.data.leaveRoom) s.data.leaveRoom();
+                if (s.data.roles) s.data.roles.delete(serverId);
+                s.leave("srv:" + serverId);
+                s.emit("server-removed", { serverId, reason: "kicked" });
+            }
+            await sendMembers(serverId);
+        } catch (error) {
+            console.error("Erro ao remover membro:", error);
+        }
+    });
+
     socket.on("leave-room", leaveCurrentRoom);
-    socket.on("disconnect", leaveCurrentRoom);
+    socket.on("disconnect", () => {
+        unregisterUserSocket();
+        leaveCurrentRoom();
+    });
 });
 
 function updateRoomState(roomCode) {
@@ -661,7 +1164,7 @@ function updateRoomState(roomCode) {
     if (!room) return;
     const participantsList = Array.from(room.participants.values());
     io.to(roomCode).emit("room-state", { participants: participantsList });
-    if (room.channelId) broadcastWorkspace();
+    if (room.channelId) broadcastServer(room.serverId);
 }
 
 const PORT = process.env.PORT || 3000;
