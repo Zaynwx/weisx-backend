@@ -20,6 +20,7 @@ const pool = new Pool({
 });
 
 const app = express();
+if (app.set) app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
@@ -230,6 +231,41 @@ async function initDb() {
     await pool.query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'msg'");
     await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS servers_name_lower ON servers (LOWER(name))");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS licensed_at TIMESTAMPTZ");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS license_source TEXT");
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS coupons (
+            code TEXT PRIMARY KEY,
+            percent INTEGER NOT NULL CHECK (percent BETWEEN 1 AND 100),
+            max_uses INTEGER,
+            used_count INTEGER NOT NULL DEFAULT 0,
+            expires_at TIMESTAMPTZ,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS coupon_uses (
+            code TEXT NOT NULL REFERENCES coupons(code) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (code, user_id)
+        )
+    `);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS payments (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            mp_id TEXT UNIQUE,
+            amount_cents INTEGER NOT NULL,
+            coupon_code TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            qr_code TEXT,
+            qr_base64 TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            paid_at TIMESTAMPTZ
+        )
+    `);
     await pool.query("ALTER TABLE servers ADD COLUMN IF NOT EXISTS icon TEXT");
     await pool.query(`
         CREATE TABLE IF NOT EXISTS categories (
@@ -300,6 +336,12 @@ app.post("/api/auth/register", async (req, res) => {
         if (!username || !password) {
             return res.status(400).json({ success: false, message: "Preencha todos os campos." });
         }
+        // Chave de ativação (opcional): confere antes de criar a conta
+        const rawKey = req.body && req.body.licenseKey ? normCode(req.body.licenseKey) : "";
+        if (rawKey) {
+            const keyError = await checkKeyPublic(rawKey, req);
+            if (keyError) return res.status(400).json({ success: false, message: keyError });
+        }
         const cleanName = String(username).trim();
         if (!cleanName || cleanName.length > 32 || String(password).length > 128) {
             return res.status(400).json({ success: false, message: "Nome de usuário ou senha em formato inválido." });
@@ -326,7 +368,21 @@ app.post("/api/auth/register", async (req, res) => {
         }
 
         const user = result.rows[0];
-        res.json({ success: true, user: { username: user.username, weisxId: user.weisx_id } });
+        let licensed = false;
+        if (rawKey) {
+            const used = await redeemCoupon(rawKey, user.id);
+            if (!used) {
+                await pool.query("DELETE FROM users WHERE id = $1 RETURNING id", [user.id]);
+                return res.status(400).json({ success: false, message: "Esta chave já foi usada." });
+            }
+            await pool.query(
+                "INSERT INTO payments (user_id, amount_cents, coupon_code, status, paid_at) VALUES ($1, 0, $2, 'approved', NOW()) RETURNING id",
+                [user.id, rawKey]
+            );
+            await grantLicense(user.id, "key");
+            licensed = true;
+        }
+        res.json({ success: true, licensed, user: { username: user.username, weisxId: user.weisx_id } });
     } catch (error) {
         serverError(res, error);
     }
@@ -392,6 +448,472 @@ app.get("/api/account/profile", async (req, res) => {
     }
 });
 
+// ---------- Licença (venda por PIX), cupons e administração ----------
+const PRICE_CENTS = Math.max(100, parseInt(process.env.PRICE_CENTS, 10) || 3000);
+const MP_TOKEN = process.env.MP_ACCESS_TOKEN || "";
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/+$/, "");
+const FREE_USERS = new Set(
+    ((process.env.FREE_USERS || "") + "," + (process.env.OWNER_USERNAME || ""))
+        .split(",").map(x => x.trim().toLowerCase()).filter(Boolean)
+);
+
+function isLicensed(user) {
+    return !!(user && (user.licensed_at || FREE_USERS.has(String(user.username).toLowerCase())));
+}
+
+function normCode(value) {
+    return String(value || "").trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "").slice(0, 24);
+}
+
+function priceFor(percent) {
+    return Math.round(PRICE_CENTS * (100 - percent) / 100);
+}
+
+async function grantLicense(userId, source) {
+    await pool.query(
+        "UPDATE users SET licensed_at = COALESCE(licensed_at, NOW()), license_source = COALESCE(license_source, $2) WHERE id = $1",
+        [userId, source]
+    );
+    for (const s of userSockets.get(userId) || []) s.emit("license-granted");
+}
+
+const couponTries = new Map(); // userId -> { count, until }
+
+function couponLocked(userId) {
+    const entry = couponTries.get(userId);
+    return !!(entry && entry.until > Date.now());
+}
+
+function couponFailed(userId) {
+    const entry = couponTries.get(userId) || { count: 0, until: 0 };
+    if (entry.until && entry.until <= Date.now()) { entry.count = 0; entry.until = 0; }
+    entry.count++;
+    if (entry.count >= 8) { entry.until = Date.now() + 10 * 60 * 1000; entry.count = 0; }
+    couponTries.set(userId, entry);
+}
+
+// Confere se o cupom vale para este usuário. Devolve { coupon } ou { error }.
+async function checkCoupon(rawCode, userId) {
+    const code = normCode(rawCode);
+    if (!code) return { error: "Digite o código do cupom." };
+    if (couponLocked(userId)) return { error: "Muitas tentativas. Tente de novo em alguns minutos." };
+    const coupon = (await pool.query("SELECT * FROM coupons WHERE code = $1", [code])).rows[0];
+    if (!coupon || !coupon.active) { couponFailed(userId); return { error: "Cupom inválido." }; }
+    if (coupon.expires_at && new Date(coupon.expires_at) < new Date()) return { error: "Este cupom expirou." };
+    if (coupon.max_uses !== null && coupon.max_uses !== undefined && coupon.used_count >= coupon.max_uses) {
+        return { error: "Este cupom já atingiu o limite de usos." };
+    }
+    const used = (await pool.query("SELECT 1 AS x FROM coupon_uses WHERE code = $1 AND user_id = $2", [code, userId])).rows[0];
+    if (used) return { error: "Você já usou este cupom." };
+    return { coupon };
+}
+
+// Consome um uso do cupom de forma atômica (evita passar do limite com cliques simultâneos)
+async function redeemCoupon(code, userId) {
+    const r = await pool.query(
+        `UPDATE coupons SET used_count = used_count + 1
+         WHERE code = $1 AND active AND (max_uses IS NULL OR used_count < max_uses)
+           AND (expires_at IS NULL OR expires_at > NOW()) RETURNING code`,
+        [code]
+    );
+    if (r.rows.length === 0) return false;
+    try {
+        await pool.query("INSERT INTO coupon_uses (code, user_id) VALUES ($1, $2)", [code, userId]);
+    } catch (error) {
+        if (error && error.code === "23505") {
+            await pool.query("UPDATE coupons SET used_count = used_count - 1 WHERE code = $1 RETURNING code", [code]);
+            return false;
+        }
+        throw error;
+    }
+    return true;
+}
+
+const keyTries = new Map(); // ip -> { count, until }
+
+// Chave de ativação = cupom de 100%. Devolve texto de erro ou null se estiver válida.
+async function checkKeyPublic(code, req) {
+    const ip = String(req.ip || "?");
+    const entry = keyTries.get(ip) || { count: 0, until: 0 };
+    if (entry.until > Date.now()) return "Muitas tentativas. Tente de novo em alguns minutos.";
+    const coupon = (await pool.query("SELECT * FROM coupons WHERE code = $1", [code])).rows[0];
+    const bad = !coupon || !coupon.active || coupon.percent !== 100;
+    if (bad) {
+        entry.count++;
+        if (entry.count >= 8) { entry.until = Date.now() + 10 * 60 * 1000; entry.count = 0; }
+        keyTries.set(ip, entry);
+        return "Chave inválida.";
+    }
+    if (coupon.expires_at && new Date(coupon.expires_at) < new Date()) return "Esta chave expirou.";
+    if (coupon.max_uses !== null && coupon.used_count >= coupon.max_uses) return "Esta chave já foi usada.";
+    return null;
+}
+
+async function authUser(req, res) {
+    const user = await getUserByToken(readToken(req));
+    if (!user) {
+        res.status(401).json({ success: false, message: "Sessão inválida ou expirada. Entre novamente." });
+        return null;
+    }
+    return user;
+}
+
+async function mpRequest(method, path, body, idempotencyKey) {
+    const response = await fetch("https://api.mercadopago.com" + path, {
+        method,
+        headers: {
+            "Authorization": "Bearer " + MP_TOKEN,
+            "Content-Type": "application/json",
+            ...(idempotencyKey ? { "X-Idempotency-Key": idempotencyKey } : {})
+        },
+        ...(body ? { body: JSON.stringify(body) } : {})
+    });
+    let data = null;
+    try { data = await response.json(); } catch (error) { data = null; }
+    return { ok: response.ok, status: response.status, data };
+}
+
+// Pergunta ao Mercado Pago o estado real do pagamento (nunca confia no que chega de fora)
+async function syncPayment(row) {
+    if (!MP_TOKEN || !row || !row.mp_id) return row ? row.status : null;
+    if (row.status === "approved") return "approved";
+    const result = await mpRequest("GET", "/v1/payments/" + encodeURIComponent(row.mp_id));
+    if (!result.ok || !result.data) return row.status;
+    const info = result.data;
+
+    if (info.status === "approved") {
+        const amountOk = Math.round(Number(info.transaction_amount) * 100) === row.amount_cents;
+        const refOk = String(info.external_reference) === String(row.id);
+        if (!amountOk || !refOk) {
+            console.error("Pagamento " + row.id + " aprovado, mas valor ou referência não conferem.");
+            return row.status;
+        }
+        const marked = await pool.query(
+            "UPDATE payments SET status = 'approved', paid_at = NOW() WHERE id = $1 AND status <> 'approved' RETURNING id",
+            [row.id]
+        );
+        if (marked.rows.length > 0) {
+            if (row.coupon_code) await redeemCoupon(row.coupon_code, row.user_id).catch(() => {});
+            await grantLicense(row.user_id, "pix");
+        }
+        return "approved";
+    }
+    if (["cancelled", "rejected", "expired"].includes(info.status)) {
+        await pool.query("UPDATE payments SET status = $2 WHERE id = $1 AND status = 'pending' RETURNING id", [row.id, info.status]);
+        return info.status;
+    }
+    return row.status;
+}
+
+function pendingPayload(row) {
+    return { amountCents: row.amount_cents, qrCode: row.qr_code, qrBase64: row.qr_base64 };
+}
+
+app.get("/api/license/status", async (req, res) => {
+    try {
+        const user = await authUser(req, res);
+        if (!user) return;
+        if (isLicensed(user)) return res.json({ success: true, licensed: true, priceCents: PRICE_CENTS });
+
+        const last = (await pool.query(
+            "SELECT * FROM payments WHERE user_id = $1 AND status = 'pending' AND mp_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+            [user.id]
+        )).rows[0];
+        if (last) {
+            const state = await syncPayment(last);
+            if (state === "approved") return res.json({ success: true, licensed: true, priceCents: PRICE_CENTS });
+            if (state === "pending") return res.json({ success: true, licensed: false, priceCents: PRICE_CENTS, pending: pendingPayload(last) });
+        }
+        res.json({ success: true, licensed: false, priceCents: PRICE_CENTS });
+    } catch (error) {
+        serverError(res, error);
+    }
+});
+
+app.post("/api/license/quote", async (req, res) => {
+    try {
+        const user = await authUser(req, res);
+        if (!user) return;
+        const checked = await checkCoupon(req.body && req.body.code, user.id);
+        if (checked.error) return res.status(400).json({ success: false, message: checked.error });
+        res.json({
+            success: true,
+            code: checked.coupon.code,
+            percent: checked.coupon.percent,
+            priceCents: priceFor(checked.coupon.percent)
+        });
+    } catch (error) {
+        serverError(res, error);
+    }
+});
+
+app.post("/api/license/checkout", async (req, res) => {
+    try {
+        const user = await authUser(req, res);
+        if (!user) return;
+        if (isLicensed(user)) return res.json({ success: true, licensed: true });
+
+        let coupon = null;
+        const rawCode = req.body && req.body.code;
+        if (rawCode && String(rawCode).trim()) {
+            const checked = await checkCoupon(rawCode, user.id);
+            if (checked.error) return res.status(400).json({ success: false, message: checked.error });
+            coupon = checked.coupon;
+        }
+        const finalCents = coupon ? priceFor(coupon.percent) : PRICE_CENTS;
+
+        // Cupom de 100%: libera o acesso na hora, sem pagamento
+        if (finalCents === 0) {
+            const ok = await redeemCoupon(coupon.code, user.id);
+            if (!ok) return res.status(400).json({ success: false, message: "Este cupom não pode mais ser usado." });
+            await pool.query(
+                "INSERT INTO payments (user_id, amount_cents, coupon_code, status, paid_at) VALUES ($1, 0, $2, 'approved', NOW()) RETURNING id",
+                [user.id, coupon.code]
+            );
+            await grantLicense(user.id, "coupon");
+            return res.json({ success: true, licensed: true });
+        }
+
+        if (!MP_TOKEN) {
+            return res.status(503).json({ success: false, message: "O pagamento ainda não está configurado. Fale com o suporte." });
+        }
+        const email = String((req.body && req.body.email) || "").trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || email.length > 120) {
+            return res.status(400).json({ success: false, message: "Digite um e-mail válido para o recibo." });
+        }
+
+        // Reaproveita o PIX ainda pendente do mesmo valor (evita gerar vários)
+        const open = (await pool.query(
+            `SELECT * FROM payments WHERE user_id = $1 AND status = 'pending' AND mp_id IS NOT NULL
+               AND amount_cents = $2 AND created_at > NOW() - INTERVAL '20 minutes' ORDER BY id DESC LIMIT 1`,
+            [user.id, finalCents]
+        )).rows[0];
+        if (open) return res.json({ success: true, licensed: false, pending: pendingPayload(open) });
+
+        const row = (await pool.query(
+            "INSERT INTO payments (user_id, amount_cents, coupon_code, status) VALUES ($1, $2, $3, 'pending') RETURNING id",
+            [user.id, finalCents, coupon ? coupon.code : null]
+        )).rows[0];
+
+        const body = {
+            transaction_amount: finalCents / 100,
+            description: "WEISX Screen - licença",
+            payment_method_id: "pix",
+            payer: { email },
+            external_reference: String(row.id)
+        };
+        if (PUBLIC_URL) body.notification_url = PUBLIC_URL + "/api/mp/webhook";
+
+        const result = await mpRequest("POST", "/v1/payments", body, crypto.randomUUID());
+        const tx = result.data && result.data.point_of_interaction && result.data.point_of_interaction.transaction_data;
+        if (!result.ok || !tx || !tx.qr_code) {
+            console.error("Mercado Pago recusou a criação do PIX:", result.status, JSON.stringify(result.data));
+            await pool.query("UPDATE payments SET status = 'failed' WHERE id = $1 RETURNING id", [row.id]);
+            return res.status(502).json({ success: false, message: "Não foi possível gerar o PIX agora. Tente de novo em instantes." });
+        }
+
+        const saved = (await pool.query(
+            "UPDATE payments SET mp_id = $2, qr_code = $3, qr_base64 = $4 WHERE id = $1 RETURNING *",
+            [row.id, String(result.data.id), tx.qr_code, tx.qr_code_base64 || null]
+        )).rows[0];
+        res.json({ success: true, licensed: false, pending: pendingPayload(saved) });
+    } catch (error) {
+        serverError(res, error);
+    }
+});
+
+// O Mercado Pago avisa aqui quando um PIX é pago. Só serve de gatilho: o estado real é consultado na API deles.
+app.post("/api/mp/webhook", async (req, res) => {
+    res.status(200).json({ ok: true });
+    try {
+        const body = req.body || {};
+        const query = req.query || {};
+        const mpId = String((body.data && body.data.id) || query["data.id"] || query.id || "");
+        if (!mpId || !/^\d{3,20}$/.test(mpId)) return;
+        const row = (await pool.query("SELECT * FROM payments WHERE mp_id = $1", [mpId])).rows[0];
+        if (row) await syncPayment(row);
+    } catch (error) {
+        console.error("Erro no aviso do Mercado Pago:", error);
+    }
+});
+
+// ----- Administração (cupons e vendas), protegida pela chave ADMIN_KEY -----
+const adminFails = new Map(); // ip -> { count, resetAt }
+
+function adminOk(req, res) {
+    if (!ADMIN_KEY) {
+        res.status(503).json({ success: false, message: "Configure a variável ADMIN_KEY no Render." });
+        return false;
+    }
+    const ip = String(req.ip || "?");
+    const fail = adminFails.get(ip);
+    if (fail && fail.resetAt > Date.now() && fail.count >= 10) {
+        res.status(429).json({ success: false, message: "Muitas tentativas. Espere um minuto." });
+        return false;
+    }
+    const given = Buffer.from(String(req.headers["x-admin-key"] || ""));
+    const wanted = Buffer.from(ADMIN_KEY);
+    const ok = given.length === wanted.length && crypto.timingSafeEqual(given, wanted);
+    if (!ok) {
+        const entry = fail && fail.resetAt > Date.now() ? fail : { count: 0, resetAt: Date.now() + 60000 };
+        entry.count++;
+        adminFails.set(ip, entry);
+        res.status(401).json({ success: false, message: "Chave incorreta." });
+        return false;
+    }
+    return true;
+}
+
+function makeCouponCode() {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let out = "WEISX-";
+    for (let i = 0; i < 6; i++) out += alphabet[crypto.randomInt(alphabet.length)];
+    return out;
+}
+
+app.get("/api/admin/coupons", async (req, res) => {
+    try {
+        if (!adminOk(req, res)) return;
+        const rows = (await pool.query("SELECT code, percent, max_uses, used_count, expires_at, active, created_at FROM coupons ORDER BY created_at DESC LIMIT 200")).rows;
+        res.json({ success: true, coupons: rows });
+    } catch (error) {
+        serverError(res, error);
+    }
+});
+
+app.post("/api/admin/coupons", async (req, res) => {
+    try {
+        if (!adminOk(req, res)) return;
+        const body = req.body || {};
+        const percent = parseInt(body.percent, 10);
+        if (!(percent >= 1 && percent <= 100)) return res.status(400).json({ success: false, message: "O desconto deve ser de 1 a 100." });
+        const code = normCode(body.code) || makeCouponCode();
+        const maxUses = body.maxUses === "" || body.maxUses === null || body.maxUses === undefined ? null : parseInt(body.maxUses, 10);
+        if (maxUses !== null && !(maxUses >= 1)) return res.status(400).json({ success: false, message: "O limite de usos deve ser 1 ou mais." });
+        let expires = null;
+        if (body.expiresAt) {
+            expires = new Date(body.expiresAt);
+            if (isNaN(expires.getTime())) return res.status(400).json({ success: false, message: "Data de validade inválida." });
+            expires = expires.toISOString();
+        }
+        try {
+            await pool.query(
+                "INSERT INTO coupons (code, percent, max_uses, expires_at) VALUES ($1, $2, $3, $4) RETURNING code",
+                [code, percent, maxUses, expires]
+            );
+        } catch (error) {
+            if (error && error.code === "23505") return res.status(409).json({ success: false, message: "Já existe um cupom com esse código." });
+            throw error;
+        }
+        res.json({ success: true, code });
+    } catch (error) {
+        serverError(res, error);
+    }
+});
+
+// Gera chaves de ativação: cada uma libera 1 conta (cupom de 100% com 1 uso)
+app.post("/api/admin/keys", async (req, res) => {
+    try {
+        if (!adminOk(req, res)) return;
+        const quantity = parseInt(req.body && req.body.quantity, 10) || 1;
+        if (quantity < 1 || quantity > 100) return res.status(400).json({ success: false, message: "Quantidade de 1 a 100." });
+        const keys = [];
+        while (keys.length < quantity) {
+            const part = () => { let t = ""; for (let i = 0; i < 4; i++) t += "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[crypto.randomInt(32)]; return t; };
+            const code = "KEY-" + part() + "-" + part() + "-" + part();
+            try {
+                await pool.query("INSERT INTO coupons (code, percent, max_uses) VALUES ($1, 100, 1) RETURNING code", [code]);
+                keys.push(code);
+            } catch (error) {
+                if (!error || error.code !== "23505") throw error;
+            }
+        }
+        res.json({ success: true, keys });
+    } catch (error) {
+        serverError(res, error);
+    }
+});
+
+app.delete("/api/admin/coupons/:code", async (req, res) => {
+    try {
+        if (!adminOk(req, res)) return;
+        await pool.query("UPDATE coupons SET active = FALSE WHERE code = $1 RETURNING code", [normCode(req.params.code)]);
+        res.json({ success: true });
+    } catch (error) {
+        serverError(res, error);
+    }
+});
+
+app.get("/api/admin/sales", async (req, res) => {
+    try {
+        if (!adminOk(req, res)) return;
+        const totals = (await pool.query(
+            `SELECT COUNT(*)::int AS sales, COALESCE(SUM(amount_cents), 0)::int AS revenue
+             FROM payments WHERE status = 'approved' AND amount_cents > 0`
+        )).rows[0];
+        const free = (await pool.query("SELECT COUNT(*)::int AS n FROM payments WHERE status = 'approved' AND amount_cents = 0")).rows[0].n;
+        const users = (await pool.query("SELECT COUNT(*)::int AS total, COUNT(licensed_at)::int AS licensed FROM users")).rows[0];
+        const recent = (await pool.query(
+            `SELECT u.username, p.amount_cents, p.coupon_code, p.paid_at
+             FROM payments p JOIN users u ON u.id = p.user_id
+             WHERE p.status = 'approved' ORDER BY p.paid_at DESC LIMIT 20`
+        )).rows;
+        res.json({ success: true, sales: totals.sales, revenueCents: totals.revenue, couponActivations: free, users: users.total, licensedUsers: users.licensed, recent });
+    } catch (error) {
+        serverError(res, error);
+    }
+});
+
+app.post("/api/admin/grant", async (req, res) => {
+    try {
+        if (!adminOk(req, res)) return;
+        const name = String((req.body && req.body.username) || "").trim().toLowerCase();
+        const found = (await pool.query("SELECT id FROM users WHERE username_lower = $1", [name])).rows[0];
+        if (!found) return res.status(404).json({ success: false, message: "Usuário não encontrado." });
+        await grantLicense(found.id, "manual");
+        res.json({ success: true });
+    } catch (error) {
+        serverError(res, error);
+    }
+});
+
+const ADMIN_HTML = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>WEISX Admin</title>
+<style>:root{color-scheme:dark}body{margin:0;background:#000;color:#f4f4f5;font:15px/1.5 "Segoe UI",system-ui,sans-serif}main{max-width:820px;margin:0 auto;padding:24px 16px}h1{margin:0 0 4px}h2{margin:28px 0 10px;font-size:17px}
+.card{background:#0d0d0d;border:1px solid #222;border-radius:12px;padding:16px}input,button{font:inherit;border-radius:8px;border:1px solid #2b2b2b;background:#000;color:#fff;padding:9px 12px}button{background:#e50914;border-color:#e50914;font-weight:700;cursor:pointer}button.s{background:#161616;border-color:#2b2b2b}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}table{width:100%;border-collapse:collapse;font-size:14px}td,th{text-align:left;padding:8px 6px;border-bottom:1px solid #1a1a1a}th{color:#a1a1aa;font-weight:600}.m{color:#a1a1aa;font-size:13px}.err{color:#ff6b6b}.ok{color:#4ade80}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.stat b{display:block;font-size:24px}</style></head><body><main>
+<h1>WEISX Admin</h1><div class="m">Cupons e vendas</div>
+<div class="card" style="margin-top:16px"><div class="row" style="margin-top:0"><input id="key" type="password" placeholder="Chave de administrador" autocomplete="off"><button id="enter">Entrar</button></div><div id="msg" class="m" style="margin-top:8px"></div></div>
+<div id="panel" style="display:none">
+<h2>Vendas</h2><div class="card"><div class="stats" id="stats"></div><table id="recent" style="margin-top:12px"></table></div>
+<h2>Novo cupom</h2><div class="card"><div class="row" style="margin-top:0"><input id="code" placeholder="Código (vazio = gerar)" maxlength="24"><input id="percent" type="number" min="1" max="100" value="100" style="width:110px" title="Desconto %"><input id="max" type="number" min="1" placeholder="Máx. usos" style="width:120px"><input id="exp" type="date" title="Validade"><button id="create">Criar cupom</button></div><div class="m" style="margin-top:8px">100% = acesso grátis. Deixe usos e validade vazios para não limitar.</div></div>
+<h2>Cupons</h2><div class="card"><table id="coupons"></table></div>
+<h2>Chaves de ativação</h2><div class="card"><div class="row" style="margin-top:0"><input id="kqty" type="number" min="1" max="100" value="1" style="width:100px"><button id="mkkeys">Gerar chaves</button></div><textarea id="keysOut" readonly rows="4" style="display:none;width:100%;margin-top:8px;background:#000;color:#fff;border:1px solid #2b2b2b;border-radius:8px;padding:8px;box-sizing:border-box"></textarea><div class="m" style="margin-top:8px">Cada chave libera 1 conta, uma única vez. A pessoa digita no campo "Chave" ao criar a conta.</div></div>
+<h2>Liberar uma conta</h2><div class="card"><div class="row" style="margin-top:0"><input id="user" placeholder="Nome de usuário"><button id="grant">Liberar acesso</button></div></div>
+</div></main>
+<script>
+const $=id=>document.getElementById(id);let KEY=sessionStorage.getItem("wk")||"";
+async function api(path,opt){opt=opt||{};const r=await fetch(path,{method:opt.method||"GET",headers:{"x-admin-key":KEY,"Content-Type":"application/json"},body:opt.body?JSON.stringify(opt.body):undefined});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.message||"Erro");return d}
+function cell(tr,text){const td=document.createElement("td");td.textContent=text;tr.appendChild(td);return td}
+const brl=c=>"R$ "+(c/100).toFixed(2).replace(".",",");
+async function load(){try{const s=await api("/api/admin/sales");$("panel").style.display="block";$("msg").textContent="";sessionStorage.setItem("wk",KEY);
+$("stats").innerHTML="";[["Vendas pagas",s.sales],["Faturamento",brl(s.revenueCents)],["Ativações por cupom",s.couponActivations],["Contas",s.users+" ("+s.licensedUsers+" liberadas)"]].forEach(x=>{const d=document.createElement("div");d.className="stat";const b=document.createElement("b");b.textContent=x[1];const m=document.createElement("span");m.className="m";m.textContent=x[0];d.append(b,m);$("stats").appendChild(d)});
+$("recent").innerHTML="";s.recent.forEach(p=>{const tr=document.createElement("tr");cell(tr,p.username);cell(tr,brl(p.amount_cents));cell(tr,p.coupon_code||"—");cell(tr,new Date(p.paid_at).toLocaleString("pt-BR"));$("recent").appendChild(tr)});
+const c=await api("/api/admin/coupons");$("coupons").innerHTML="";const h=document.createElement("tr");["Código","Desconto","Usos","Validade",""].forEach(t=>{const th=document.createElement("th");th.textContent=t;h.appendChild(th)});$("coupons").appendChild(h);
+c.coupons.forEach(x=>{const tr=document.createElement("tr");cell(tr,x.code);cell(tr,x.percent+"%");cell(tr,x.used_count+(x.max_uses?" / "+x.max_uses:""));cell(tr,x.expires_at?new Date(x.expires_at).toLocaleDateString("pt-BR"):"sem validade");const td=document.createElement("td");if(x.active){const b=document.createElement("button");b.className="s";b.textContent="Desativar";b.onclick=async()=>{await api("/api/admin/coupons/"+encodeURIComponent(x.code),{method:"DELETE"});load()};td.appendChild(b)}else td.textContent="desativado";tr.appendChild(td);$("coupons").appendChild(tr)})}
+catch(e){$("panel").style.display="none";$("msg").className="m err";$("msg").textContent=e.message}}
+$("enter").onclick=()=>{KEY=$("key").value;load()};
+$("create").onclick=async()=>{try{const d=await api("/api/admin/coupons",{method:"POST",body:{code:$("code").value,percent:$("percent").value,maxUses:$("max").value,expiresAt:$("exp").value}});$("msg").className="m ok";$("msg").textContent="Cupom criado: "+d.code;$("code").value="";load()}catch(e){$("msg").className="m err";$("msg").textContent=e.message}};
+$("mkkeys").onclick=async()=>{try{const d=await api("/api/admin/keys",{method:"POST",body:{quantity:$("kqty").value}});$("keysOut").style.display="block";$("keysOut").value=d.keys.join("\\n");$("msg").className="m ok";$("msg").textContent=d.keys.length+" chave(s) gerada(s).";load()}catch(e){$("msg").className="m err";$("msg").textContent=e.message}};
+$("grant").onclick=async()=>{try{await api("/api/admin/grant",{method:"POST",body:{username:$("user").value}});$("msg").className="m ok";$("msg").textContent="Acesso liberado.";$("user").value="";load()}catch(e){$("msg").className="m err";$("msg").textContent=e.message}};
+if(KEY)load();
+</script></body></html>`;
+
+app.get("/admin", (req, res) => {
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(ADMIN_HTML);
+});
+
 // Descobre o nome da conta a partir do token de login (ou null se inválido)
 async function resolveUsernameFromToken(token) {
     try {
@@ -409,7 +931,12 @@ io.on("connection", socket => {
     let currentUsername = "Convidado";
 
     socket.on("create-room", async (roomCode, auth) => {
-        currentUsername = (await resolveUsernameFromToken(auth && auth.token)) || "Convidado";
+        const roomUser = await getUserByToken(auth && auth.token).catch(() => null);
+        if (!isLicensed(roomUser)) {
+            socket.emit("room-error", "Ative sua licença para usar o WEISX Screen.");
+            return;
+        }
+        currentUsername = roomUser.username;
         currentRoomCode = roomCode;
         socket.join(roomCode);
         rooms.set(roomCode, {
@@ -426,7 +953,12 @@ io.on("connection", socket => {
             socket.emit("room-error", "Sala não encontrada.");
             return;
         }
-        currentUsername = (await resolveUsernameFromToken(auth && auth.token)) || "Convidado";
+        const roomUser = await getUserByToken(auth && auth.token).catch(() => null);
+        if (!isLicensed(roomUser)) {
+            socket.emit("room-error", "Ative sua licença para usar o WEISX Screen.");
+            return;
+        }
+        currentUsername = roomUser.username;
         currentRoomCode = roomCode;
         socket.join(roomCode);
         room.participants.set(socket.id, { id: socket.id, name: currentUsername, isHost: false, broadcasting: false });
@@ -541,6 +1073,10 @@ io.on("connection", socket => {
                 socket.emit("workspace-error", "Sessão inválida. Entre novamente.");
                 return;
             }
+            if (!isLicensed(user)) {
+                socket.emit("license-required");
+                return;
+            }
             socket.data.user = { id: user.id, username: user.username, avatar: user.avatar || null };
             socket.data.roles = new Map();
             registerUserSocket();
@@ -647,6 +1183,18 @@ io.on("connection", socket => {
 
     function registerUserSocket() {
         const id = socket.data.user.id;
+        if (!userSockets.has(id)) userSockets.set(id, new Set());
+        // Uma conta online por vez: quem entra por último derruba a sessão anterior
+        for (const other of Array.from(userSockets.get(id))) {
+            if (other === socket) continue;
+            try {
+                other.emit("session-replaced");
+                if (other.data && other.data.leaveRoom) other.data.leaveRoom();
+                const set = userSockets.get(id);
+                if (set) set.delete(other);
+                other.disconnect(true);
+            } catch (error) {}
+        }
         if (!userSockets.has(id)) userSockets.set(id, new Set());
         userSockets.get(id).add(socket);
         socket.data.leaveRoom = leaveCurrentRoom;
