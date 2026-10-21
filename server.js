@@ -165,6 +165,14 @@ async function postSystem(channelId, username, kind) {
     });
 }
 
+// Aviso de membro no grupo: vai no primeiro canal do grupo, só quando a pessoa entra ou sai de verdade.
+async function postGroupNotice(serverId, username, kind) {
+    const ch = (await pool.query(
+        "SELECT id FROM channels WHERE server_id = $1 ORDER BY position, id LIMIT 1", [serverId]
+    )).rows[0];
+    if (ch) await postSystem(ch.id, username, kind);
+}
+
 // ---------- Banco de dados (contas e sessões) ----------
 const SESSION_DAYS = 90;
 
@@ -229,6 +237,10 @@ async function initDb() {
     `);
 
     await pool.query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'msg'");
+    // Limpeza única: apaga os avisos antigos de "entrou/saiu do canal" que enchiam o chat.
+    await pool.query("CREATE TABLE IF NOT EXISTS app_flags (key TEXT PRIMARY KEY)");
+    const purge = await pool.query("INSERT INTO app_flags (key) VALUES ('purge-presence-v1') ON CONFLICT DO NOTHING RETURNING key");
+    if (purge.rowCount) await pool.query("DELETE FROM messages WHERE kind IN ('join','leave')");
     await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS servers_name_lower ON servers (LOWER(name))");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS licensed_at TIMESTAMPTZ");
@@ -1051,9 +1063,6 @@ io.on("connection", socket => {
         } else {
             const who = room.participants.get(socket.id);
             room.participants.delete(socket.id);
-            if (room.channelId && who) {
-                postSystem(room.channelId, who.name, "leave").catch(error => console.error("Erro no aviso de saída:", error));
-            }
             if (room.viewers) {
                 room.viewers.delete(socket.id);
                 room.viewers.forEach(set => set.delete(socket.id));
@@ -1144,7 +1153,6 @@ io.on("connection", socket => {
             for (const row of avatarRows) avatars[row.username] = row.avatar;
             socket.emit("chat-history", { channelId, messages: await loadMessages(channelId), avatars });
             updateRoomState(code);
-            await postSystem(channelId, currentUsername, "join");
         } catch (error) {
             console.error("Erro ao entrar no canal:", error);
             socket.emit("room-error", "Não foi possível entrar no canal.");
@@ -1400,6 +1408,7 @@ io.on("connection", socket => {
                     [serverId, userId]
                 );
                 role = (await getRole(userId, serverId)) || "member";
+                postGroupNotice(serverId, socket.data.user.username, "join").catch(e => console.error("Aviso de entrada:", e));
             }
 
             socket.data.roles.set(serverId, role);
@@ -1430,6 +1439,7 @@ io.on("connection", socket => {
             socket.data.roles.delete(serverId);
             socket.leave("srv:" + serverId);
             socket.emit("server-removed", { serverId, reason: "left" });
+            postGroupNotice(serverId, socket.data.user.username, "leave").catch(e => console.error("Aviso de saída:", e));
         } catch (error) {
             console.error("Erro ao sair do grupo:", error);
         }
