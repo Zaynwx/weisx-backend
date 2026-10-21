@@ -458,7 +458,10 @@ const FREE_USERS = new Set(
         .split(",").map(x => x.trim().toLowerCase()).filter(Boolean)
 );
 
+// App gratuito por padrão. Para voltar a cobrar, defina PAID_MODE=true no Render.
+const PAID_MODE = String(process.env.PAID_MODE || "").toLowerCase() === "true";
 function isLicensed(user) {
+    if (!PAID_MODE) return true;
     return !!(user && (user.licensed_at || FREE_USERS.has(String(user.username).toLowerCase())));
 }
 
