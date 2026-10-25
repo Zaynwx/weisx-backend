@@ -165,6 +165,25 @@ async function postSystem(channelId, username, kind) {
     });
 }
 
+// Tempo de uso: soma os segundos da sessão ao total da conta (a cada minuto e ao sair).
+async function flushUsage(sock, final) {
+    try {
+        const d = sock && sock.data;
+        if (!d || !d.usageUser || !d.usageAt) return;
+        const now = Date.now();
+        const secs = Math.max(0, Math.round((now - d.usageAt) / 1000));
+        const uid = d.usageUser;
+        d.usageAt = final ? 0 : now;
+        if (final) d.usageUser = 0;
+        await pool.query("UPDATE users SET total_seconds = total_seconds + $1, last_seen_at = NOW() WHERE id = $2", [secs, uid]);
+    } catch (error) {
+        console.error("Erro ao salvar tempo de uso:", error.message);
+    }
+}
+setInterval(() => {
+    for (const set of userSockets.values()) for (const sock of set) flushUsage(sock, false);
+}, 60000);
+
 // Aviso de membro no grupo: vai no primeiro canal do grupo, só quando a pessoa entra ou sai de verdade.
 async function postGroupNotice(serverId, username, kind) {
     const ch = (await pool.query(
@@ -196,6 +215,9 @@ async function initDb() {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS total_seconds BIGINT NOT NULL DEFAULT 0");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS session_count INTEGER NOT NULL DEFAULT 0");
     await pool.query(`DELETE FROM sessions WHERE created_at < NOW() - INTERVAL '${SESSION_DAYS} days'`);
 
     await pool.query(`
@@ -880,6 +902,31 @@ app.get("/api/admin/sales", async (req, res) => {
     }
 });
 
+app.get("/api/admin/accounts", async (req, res) => {
+    try {
+        if (!adminOk(req, res)) return;
+        const rows = (await pool.query(
+            `SELECT id, username, created_at, last_seen_at, total_seconds, session_count, licensed_at
+             FROM users ORDER BY created_at DESC LIMIT 300`
+        )).rows;
+        const accounts = rows.map(r => {
+            let live = 0;
+            for (const sock of userSockets.get(r.id) || []) {
+                if (sock.data && sock.data.usageAt) live = Math.max(live, Math.round((Date.now() - sock.data.usageAt) / 1000));
+            }
+            return {
+                username: r.username, createdAt: r.created_at, lastSeenAt: r.last_seen_at,
+                totalSeconds: Number(r.total_seconds) + live, sessions: r.session_count,
+                online: userSockets.has(r.id)
+            };
+        });
+        const today = (await pool.query("SELECT COUNT(*)::int AS n FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'")).rows[0].n;
+        res.json({ success: true, accounts, onlineNow: userSockets.size, newToday: today });
+    } catch (error) {
+        serverError(res, error);
+    }
+});
+
 app.post("/api/admin/grant", async (req, res) => {
     try {
         if (!adminOk(req, res)) return;
@@ -901,6 +948,7 @@ const ADMIN_HTML = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8
 <div class="card" style="margin-top:16px"><div class="row" style="margin-top:0"><input id="key" type="password" placeholder="Chave de administrador" autocomplete="off"><button id="enter">Entrar</button></div><div id="msg" class="m" style="margin-top:8px"></div></div>
 <div id="panel" style="display:none">
 <h2>Vendas</h2><div class="card"><div class="stats" id="stats"></div><table id="recent" style="margin-top:12px"></table></div>
+<h2>Contas</h2><div class="card"><div class="stats" id="astats"></div><div style="overflow-x:auto"><table id="accounts" style="margin-top:12px"></table></div><div class="m" style="margin-top:8px">Atualiza sozinho a cada 30 segundos. O tempo de uso conta desde esta atualização do servidor.</div></div>
 <h2>Novo cupom</h2><div class="card"><div class="row" style="margin-top:0"><input id="code" placeholder="Código (vazio = gerar)" maxlength="24"><input id="percent" type="number" min="1" max="100" value="100" style="width:110px" title="Desconto %"><input id="max" type="number" min="1" placeholder="Máx. usos" style="width:120px"><input id="exp" type="date" title="Validade"><button id="create">Criar cupom</button></div><div class="m" style="margin-top:8px">100% = acesso grátis. Deixe usos e validade vazios para não limitar.</div></div>
 <h2>Cupons</h2><div class="card"><table id="coupons"></table></div>
 <h2>Chaves de ativação</h2><div class="card"><div class="row" style="margin-top:0"><input id="kqty" type="number" min="1" max="100" value="1" style="width:100px"><button id="mkkeys">Gerar chaves</button></div><textarea id="keysOut" readonly rows="4" style="display:none;width:100%;margin-top:8px;background:#000;color:#fff;border:1px solid #2b2b2b;border-radius:8px;padding:8px;box-sizing:border-box"></textarea><div class="m" style="margin-top:8px">Cada chave libera 1 conta, uma única vez. A pessoa digita no campo "Chave" ao criar a conta.</div></div>
@@ -914,13 +962,19 @@ const brl=c=>"R$ "+(c/100).toFixed(2).replace(".",",");
 async function load(){try{const s=await api("/api/admin/sales");$("panel").style.display="block";$("msg").textContent="";sessionStorage.setItem("wk",KEY);
 $("stats").innerHTML="";[["Vendas pagas",s.sales],["Faturamento",brl(s.revenueCents)],["Ativações por cupom",s.couponActivations],["Contas",s.users+" ("+s.licensedUsers+" liberadas)"]].forEach(x=>{const d=document.createElement("div");d.className="stat";const b=document.createElement("b");b.textContent=x[1];const m=document.createElement("span");m.className="m";m.textContent=x[0];d.append(b,m);$("stats").appendChild(d)});
 $("recent").innerHTML="";s.recent.forEach(p=>{const tr=document.createElement("tr");cell(tr,p.username);cell(tr,brl(p.amount_cents));cell(tr,p.coupon_code||"—");cell(tr,new Date(p.paid_at).toLocaleString("pt-BR"));$("recent").appendChild(tr)});
-const c=await api("/api/admin/coupons");$("coupons").innerHTML="";const h=document.createElement("tr");["Código","Desconto","Usos","Validade",""].forEach(t=>{const th=document.createElement("th");th.textContent=t;h.appendChild(th)});$("coupons").appendChild(h);
+loadAccounts();const c=await api("/api/admin/coupons");$("coupons").innerHTML="";const h=document.createElement("tr");["Código","Desconto","Usos","Validade",""].forEach(t=>{const th=document.createElement("th");th.textContent=t;h.appendChild(th)});$("coupons").appendChild(h);
 c.coupons.forEach(x=>{const tr=document.createElement("tr");cell(tr,x.code);cell(tr,x.percent+"%");cell(tr,x.used_count+(x.max_uses?" / "+x.max_uses:""));cell(tr,x.expires_at?new Date(x.expires_at).toLocaleDateString("pt-BR"):"sem validade");const td=document.createElement("td");if(x.active){const b=document.createElement("button");b.className="s";b.textContent="Desativar";b.onclick=async()=>{await api("/api/admin/coupons/"+encodeURIComponent(x.code),{method:"DELETE"});load()};td.appendChild(b)}else td.textContent="desativado";tr.appendChild(td);$("coupons").appendChild(tr)})}
 catch(e){$("panel").style.display="none";$("msg").className="m err";$("msg").textContent=e.message}}
 $("enter").onclick=()=>{KEY=$("key").value;load()};
 $("create").onclick=async()=>{try{const d=await api("/api/admin/coupons",{method:"POST",body:{code:$("code").value,percent:$("percent").value,maxUses:$("max").value,expiresAt:$("exp").value}});$("msg").className="m ok";$("msg").textContent="Cupom criado: "+d.code;$("code").value="";load()}catch(e){$("msg").className="m err";$("msg").textContent=e.message}};
 $("mkkeys").onclick=async()=>{try{const d=await api("/api/admin/keys",{method:"POST",body:{quantity:$("kqty").value}});$("keysOut").style.display="block";$("keysOut").value=d.keys.join("\\n");$("msg").className="m ok";$("msg").textContent=d.keys.length+" chave(s) gerada(s).";load()}catch(e){$("msg").className="m err";$("msg").textContent=e.message}};
 $("grant").onclick=async()=>{try{await api("/api/admin/grant",{method:"POST",body:{username:$("user").value}});$("msg").className="m ok";$("msg").textContent="Acesso liberado.";$("user").value="";load()}catch(e){$("msg").className="m err";$("msg").textContent=e.message}};
+function dur(sec){sec=Math.floor(sec);if(sec<60)return sec+"s";const m=Math.floor(sec/60);if(m<60)return m+" min";const h=Math.floor(m/60);return h+"h "+String(m%60).padStart(2,"0")+"min"}
+function ago(d){if(!d)return "—";const s=(Date.now()-new Date(d).getTime())/1000;if(s<90)return "agora";if(s<3600)return "há "+Math.floor(s/60)+" min";if(s<86400)return "há "+Math.floor(s/3600)+" h";return new Date(d).toLocaleDateString("pt-BR")}
+async function loadAccounts(){try{const a=await api("/api/admin/accounts");$("astats").innerHTML="";[["Online agora",a.onlineNow],["Contas novas (24h)",a.newToday],["Total de contas",a.accounts.length]].forEach(x=>{const d=document.createElement("div");d.className="stat";const b=document.createElement("b");b.textContent=x[1];const m=document.createElement("span");m.className="m";m.textContent=x[0];d.append(b,m);$("astats").appendChild(d)});
+$("accounts").innerHTML="";const h=document.createElement("tr");["Usuário","Status","Tempo de uso","Último acesso","Acessos","Criada em"].forEach(t=>{const th=document.createElement("th");th.textContent=t;h.appendChild(th)});$("accounts").appendChild(h);
+a.accounts.forEach(x=>{const tr=document.createElement("tr");cell(tr,x.username);const st=cell(tr,x.online?"● online":"○ offline");st.style.color=x.online?"#4ade80":"#71717a";cell(tr,dur(x.totalSeconds));cell(tr,x.online?"agora":ago(x.lastSeenAt));cell(tr,x.sessions);cell(tr,new Date(x.createdAt).toLocaleString("pt-BR"));$("accounts").appendChild(tr)})}catch(e){}}
+setInterval(()=>{if($("panel").style.display==="block")loadAccounts()},30000);
 if(KEY)load();
 </script></body></html>`;
 
@@ -1209,11 +1263,18 @@ io.on("connection", socket => {
         if (!userSockets.has(id)) userSockets.set(id, new Set());
         userSockets.get(id).add(socket);
         socket.data.leaveRoom = leaveCurrentRoom;
+        if (!socket.data.usageAt) {
+            socket.data.usageUser = id;
+            socket.data.usageAt = Date.now();
+            pool.query("UPDATE users SET session_count = session_count + 1, last_seen_at = NOW() WHERE id = $1", [id])
+                .catch(error => console.error("Erro ao contar acesso:", error.message));
+        }
     }
 
     function unregisterUserSocket() {
         const user = socket.data.user;
         if (!user) return;
+        flushUsage(socket, true);
         const set = userSockets.get(user.id);
         if (set) {
             set.delete(socket);
