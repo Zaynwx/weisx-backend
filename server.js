@@ -471,6 +471,54 @@ app.post("/api/auth/logout", async (req, res) => {
     }
 });
 
+// =====================================================================
+// TURN da Cloudflare (conexão funciona até atrás de CGNAT / 4G)
+// No Render, em Environment, crie:
+//   CF_TURN_KEY_ID     = o "Turn Token ID" da Cloudflare
+//   CF_TURN_API_TOKEN  = o "API Token" da mesma chave
+// Sem essas variáveis a rota devolve só STUN e o app continua funcionando.
+// =====================================================================
+let turnCache = { iceServers: null, expiresAt: 0 };
+
+app.get("/api/turn", async (req, res) => {
+    const fallback = { iceServers: [{ urls: ["stun:stun.cloudflare.com:3478"] }] };
+    try {
+        // Só quem está logado pega acesso TURN (ninguém de fora gasta a sua cota)
+        const user = await authUser(req, res);
+        if (!user) return;
+
+        const keyId = process.env.CF_TURN_KEY_ID;
+        const apiToken = process.env.CF_TURN_API_TOKEN;
+        if (!keyId || !apiToken) return res.json(fallback);
+
+        // Reaproveita o mesmo acesso por até 12h (ele vale 24h)
+        if (turnCache.iceServers && Date.now() < turnCache.expiresAt) {
+            return res.json({ iceServers: turnCache.iceServers });
+        }
+
+        const response = await fetch(
+            "https://rtc.live.cloudflare.com/v1/turn/keys/" + keyId + "/credentials/generate-ice-servers",
+            {
+                method: "POST",
+                headers: {
+                    "Authorization": "Bearer " + apiToken,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ ttl: 86400 })
+            }
+        );
+        if (!response.ok) throw new Error("Cloudflare respondeu " + response.status);
+
+        const data = await response.json();
+        const list = Array.isArray(data.iceServers) ? data.iceServers : [data.iceServers];
+        turnCache = { iceServers: list, expiresAt: Date.now() + 12 * 60 * 60 * 1000 };
+        res.json({ iceServers: list });
+    } catch (error) {
+        console.error("[TURN] erro:", error.message);
+        if (!res.headersSent) res.json(fallback);
+    }
+});
+
 // Perfil
 app.get("/api/account/profile", async (req, res) => {
     try {
